@@ -1,127 +1,466 @@
 ---
-- name: Update first K3s control-plane node
+- name: Validate K3s upgrade and create a recovery snapshot
   hosts: master
-  become: yes
+  become: true
+  any_errors_fatal: true
   vars:
-    k3s_first_server_exec: "server --disable traefik --cluster-init --node-name {{ inventory_hostname }}"
+    k3s_release_arch: arm64
   tasks:
-    - name: Check existing SQLite datastore
-      ansible.builtin.stat:
-        path: /var/lib/rancher/k3s/server/db/state.db
-      register: k3s_sqlite_db
-      when: inventory_hostname == groups['master'][0]
-
-    - name: Check existing etcd datastore
+    - name: Check embedded etcd datastore
       ansible.builtin.stat:
         path: /var/lib/rancher/k3s/server/db/etcd
       register: k3s_etcd_db
-      when: inventory_hostname == groups['master'][0]
 
-    - name: Refuse if first master has neither SQLite nor etcd data
-      ansible.builtin.fail:
-        msg: "First master has no SQLite or etcd datastore. This does not look like the current source-of-truth K3s server."
-      when:
-        - inventory_hostname == groups['master'][0]
-        - not k3s_sqlite_db.stat.exists
-        - not k3s_etcd_db.stat.exists
+    - name: Require embedded etcd on every control-plane node
+      ansible.builtin.assert:
+        that:
+          - k3s_etcd_db.stat.exists
+          - k3s_etcd_db.stat.isdir
+        fail_msg: >-
+          Embedded etcd was not found on {{ inventory_hostname }}. Refusing to
+          create a snapshot or update K3s.
 
-    - name: Check for existing K3s agent service
-      ansible.builtin.stat:
-        path: /etc/systemd/system/k3s-agent.service
-      register: k3s_agent_service
-      when: inventory_hostname == groups['master'][0]
+    - name: Require ARM64 homelab nodes
+      ansible.builtin.assert:
+        that:
+          - ansible_architecture in ['aarch64', 'arm64']
+        fail_msg: >-
+          This homelab playbook supports only ARM64, but
+          {{ inventory_hostname }} reports {{ ansible_architecture }}.
 
-    - name: Stop K3s agent before promoting first node to server
-      ansible.builtin.systemd:
-        name: k3s-agent
-        enabled: no
-        state: stopped
-      when:
-        - inventory_hostname == groups['master'][0]
-        - k3s_agent_service.stat.exists
-
-    - name: Install or update first K3s server with embedded etcd
-      ansible.builtin.shell: |
-        curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={{ k3s_version }} INSTALL_K3S_EXEC="{{ k3s_first_server_exec }}" sh -
-      args:
-        executable: /bin/bash
-      when: inventory_hostname == groups['master'][0]
-
-    - name: Ensure first K3s server is enabled and running
-      ansible.builtin.systemd:
-        name: k3s
-        enabled: yes
-        state: started
-        daemon_reload: yes
-      when: inventory_hostname == groups['master'][0]
-
-    - name: Wait for first K3s server API
-      ansible.builtin.command: k3s kubectl get nodes
-      register: k3s_first_nodes
+    - name: Read current K3s version
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - --version
+      register: k3s_current_version_output
       changed_when: false
-      retries: 30
-      delay: 10
-      until: k3s_first_nodes.rc == 0
+
+    - name: Reject downgrades and skipped Kubernetes minor versions
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import re
+            import sys
+
+            pattern = r"v(\d+)\.(\d+)\.(\d+)\+k3s(\d+)"
+            current_match = re.search(pattern, sys.argv[1])
+            target_match = re.fullmatch(pattern, sys.argv[2])
+            if not current_match or not target_match:
+                raise SystemExit("versions must match vX.Y.Z+k3sN")
+            current = tuple(map(int, current_match.groups()))
+            target = tuple(map(int, target_match.groups()))
+            if target[0] != current[0]:
+                raise SystemExit("Kubernetes major version must not change")
+            if not current[1] <= target[1] <= current[1] + 1:
+                raise SystemExit("downgrade or Kubernetes minor skip rejected")
+            if target[1] == current[1] and target[2:] < current[2:]:
+                raise SystemExit("K3s patch or build downgrade rejected")
+          - "{{ k3s_current_version_output.stdout }}"
+          - "{{ k3s_version }}"
+      changed_when: false
+
+    - name: Wait for Kubernetes API readiness before snapshot
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - --raw=/readyz
+      register: k3s_api_ready_before_upgrade
+      changed_when: false
+      retries: 12
+      delay: 5
+      until:
+        - k3s_api_ready_before_upgrade.rc == 0
+        - k3s_api_ready_before_upgrade.stdout | trim == 'ok'
       when: inventory_hostname == groups['master'][0]
 
-    - name: Retrieve K3s token from first server
-      ansible.builtin.shell: cat /var/lib/rancher/k3s/server/node-token
-      register: k3s_token
+    - name: Require all nodes to be Ready before snapshot
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - wait
+          - --for=condition=Ready
+          - nodes
+          - --all
+          - --timeout=300s
       changed_when: false
       when: inventory_hostname == groups['master'][0]
 
-- name: Update or promote remaining K3s control-plane nodes
+    - name: Require all etcd members to be voters before snapshot
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - wait
+          - --for=condition=EtcdIsVoter
+          - nodes
+          - --all
+          - --timeout=300s
+      changed_when: false
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Verify etcd membership and health before snapshot
+      ansible.builtin.include_tasks: tasks/verify_k3s_etcd.yaml
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Build unique pre-upgrade snapshot name
+      ansible.builtin.set_fact:
+        k3s_pre_upgrade_snapshot_name: >-
+          pre-upgrade-{{ k3s_version
+          | regex_replace('[^A-Za-z0-9_.-]', '_') }}-{{
+          ansible_date_time.iso8601_basic_short }}
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Create pre-upgrade etcd snapshot
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - etcd-snapshot
+          - save
+          - --name
+          - "{{ k3s_pre_upgrade_snapshot_name }}"
+      register: k3s_snapshot_save
+      changed_when: k3s_snapshot_save.rc == 0
+      when: inventory_hostname == groups['master'][0]
+
+    - name: List available etcd snapshots
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - etcd-snapshot
+          - ls
+      register: k3s_snapshot_list
+      changed_when: false
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Verify pre-upgrade snapshot is available
+      ansible.builtin.assert:
+        that:
+          - k3s_pre_upgrade_snapshot_name in k3s_snapshot_list.stdout
+        fail_msg: >-
+          The pre-upgrade etcd snapshot was not found after creation.
+          Refusing to update K3s.
+        success_msg: "Pre-upgrade etcd snapshot was created and verified."
+      when: inventory_hostname == groups['master'][0]
+
+- name: Update K3s control-plane nodes one at a time
   hosts: master
-  become: yes
+  become: true
   serial: 1
+  any_errors_fatal: true
   vars:
-    k3s_join_server_exec: "server --disable traefik --node-name {{ inventory_hostname }}"
+    k3s_release_arch: arm64
+    k3s_release_tag: "{{ k3s_version | urlencode }}"
+    k3s_release_base_url: >-
+      https://github.com/k3s-io/k3s/releases/download/{{ k3s_release_tag }}
   tasks:
-    - name: Check for existing K3s agent service
-      ansible.builtin.stat:
-        path: /etc/systemd/system/k3s-agent.service
-      register: k3s_agent_service
-      when: inventory_hostname != groups['master'][0]
+    - name: Verify etcd quorum before disrupting this member
+      ansible.builtin.include_tasks: tasks/verify_k3s_etcd.yaml
 
-    - name: Stop K3s agent before promoting node to server
-      ansible.builtin.systemd:
-        name: k3s-agent
-        enabled: no
-        state: stopped
-      when:
-        - inventory_hostname != groups['master'][0]
-        - k3s_agent_service.stat.exists
+    - name: Download target K3s checksum list
+      ansible.builtin.get_url:
+        url: >-
+          {{ k3s_release_base_url }}/sha256sum-{{ k3s_release_arch }}.txt
+        dest: "/var/tmp/sha256sum-{{ k3s_release_arch }}.txt"
+        mode: "0644"
 
-    - name: Install or update K3s server joined to embedded-etcd cluster
-      ansible.builtin.shell: |
-        curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={{ k3s_version }} K3S_URL=https://{{ hostvars[groups['master'][0]]['ansible_host'] }}:6443 K3S_TOKEN={{ hostvars[groups['master'][0]].k3s_token.stdout }} INSTALL_K3S_EXEC="{{ k3s_join_server_exec }}" sh -
-      args:
-        executable: /bin/bash
-      when: inventory_hostname != groups['master'][0]
+    - name: Download target K3s binary
+      ansible.builtin.get_url:
+        url: "{{ k3s_release_base_url }}/k3s-{{ k3s_release_arch }}"
+        dest: "/var/tmp/k3s-{{ k3s_release_arch }}"
+        mode: "0755"
 
-    - name: Ensure K3s server is enabled and running
+    - name: Verify target K3s binary checksum
+      ansible.builtin.command:
+        argv:
+          - sha256sum
+          - --check
+          - --ignore-missing
+          - "sha256sum-{{ k3s_release_arch }}.txt"
+        chdir: /var/tmp
+      register: k3s_checksum_result
+      changed_when: false
+      failed_when: >-
+        k3s_checksum_result.rc != 0
+        or ('k3s-' + k3s_release_arch + ': OK') not in
+        k3s_checksum_result.stdout
+
+    - name: Install verified K3s binary
+      ansible.builtin.copy:
+        src: "/var/tmp/k3s-{{ k3s_release_arch }}"
+        dest: /usr/local/bin/k3s
+        owner: root
+        group: root
+        mode: "0755"
+        remote_src: true
+        backup: true
+      register: k3s_binary_install
+
+    # Immediate restart is required before validating this serial batch.
+    - name: Restart K3s server with verified binary  # noqa: no-handler
       ansible.builtin.systemd:
         name: k3s
-        enabled: yes
-        state: started
-        daemon_reload: yes
-      when: inventory_hostname != groups['master'][0]
+        enabled: true
+        state: restarted
+      when: k3s_binary_install.changed
 
-    - name: Wait for K3s server to report node access
-      ansible.builtin.command: k3s kubectl get nodes
-      register: k3s_joined_nodes
+    - name: Wait for local Kubernetes API after update
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - --raw=/readyz
+      register: k3s_local_api_ready
       changed_when: false
       retries: 30
       delay: 10
-      until: k3s_joined_nodes.rc == 0
-      when: inventory_hostname != groups['master'][0]
+      until:
+        - k3s_local_api_ready.rc == 0
+        - k3s_local_api_ready.stdout | trim == 'ok'
 
-- name: Verify K3s control plane
+    - name: Verify local API reports healthy etcd
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - --raw=/readyz?verbose
+      register: k3s_local_api_verbose
+      changed_when: false
+      retries: 30
+      delay: 10
+      until:
+        - k3s_local_api_verbose.rc == 0
+        - "'[+]etcd ok' in k3s_local_api_verbose.stdout"
+
+    - name: Read updated K3s version
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - --version
+      register: k3s_updated_version_output
+      changed_when: false
+
+    - name: Verify exact updated K3s version
+      ansible.builtin.assert:
+        that:
+          - >-
+            (k3s_updated_version_output.stdout
+             | regex_search('v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+'))
+            == k3s_version
+        fail_msg: >-
+          {{ inventory_hostname }} did not install the exact requested version
+          {{ k3s_version }}. Output: {{ k3s_updated_version_output.stdout }}
+
+    - name: Wait for updated node to become Ready
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - wait
+          - --for=condition=Ready
+          - "node/{{ inventory_hostname }}"
+          - --timeout=300s
+      changed_when: false
+
+    - name: Wait for updated etcd member to become a voter
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - wait
+          - --for=condition=EtcdIsVoter
+          - "node/{{ inventory_hostname }}"
+          - --timeout=300s
+      changed_when: false
+
+    - name: Require all nodes to remain Ready before continuing
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - wait
+          - --for=condition=Ready
+          - nodes
+          - --all
+          - --timeout=300s
+      changed_when: false
+
+    - name: Verify etcd quorum before continuing to the next member
+      ansible.builtin.include_tasks: tasks/verify_k3s_etcd.yaml
+
+- name: Verify K3s cluster after rolling update
   hosts: master
-  become: yes
+  become: true
+  any_errors_fatal: true
   tasks:
-    - name: Confirm all K3s nodes are visible
-      ansible.builtin.command: k3s kubectl get nodes -o wide
+    - name: Wait for all nodes to become Ready
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - wait
+          - --for=condition=Ready
+          - nodes
+          - --all
+          - --timeout=300s
+      changed_when: false
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Wait for all etcd members to be voters
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - wait
+          - --for=condition=EtcdIsVoter
+          - nodes
+          - --all
+          - --timeout=300s
+      changed_when: false
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Verify final authoritative etcd membership and health
+      ansible.builtin.include_tasks: tasks/verify_k3s_etcd.yaml
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Read all pods for readiness verification
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - pods
+          - --all-namespaces
+          - --output=json
+      register: k3s_all_pods
+      changed_when: false
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Wait for every active pod to become Ready
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - wait
+          - --for=condition=Ready
+          - "pod/{{ item.metadata.name }}"
+          - "--namespace={{ item.metadata.namespace }}"
+          - --timeout=300s
+      loop: >-
+        {{ (k3s_all_pods.stdout | from_json).items
+           | rejectattr('status.phase', 'equalto', 'Succeeded')
+           | list }}
+      loop_control:
+        label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+      changed_when: false
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Verify a fresh pod snapshot has no active unready pods
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import json
+            import subprocess
+
+            result = subprocess.run(
+                ["k3s", "kubectl", "get", "pods", "-A", "-o", "json"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            pods = json.loads(result.stdout)["items"]
+            unready = []
+            for pod in pods:
+                if pod["status"].get("phase") == "Succeeded":
+                    continue
+                ready = any(
+                    condition.get("type") == "Ready"
+                    and condition.get("status") == "True"
+                    for condition in pod["status"].get("conditions", [])
+                )
+                if not ready:
+                    metadata = pod["metadata"]
+                    unready.append(
+                        f"{metadata['namespace']}/{metadata['name']}"
+                    )
+            if unready:
+                raise SystemExit("unready pods: " + ", ".join(unready))
+      changed_when: false
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Wait for all Flux Kustomizations to become Ready
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - wait
+          - --for=condition=Ready
+          - kustomizations.kustomize.toolkit.fluxcd.io
+          - --all
+          - --all-namespaces
+          - --timeout=300s
+      changed_when: false
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Wait for all Flux HelmReleases to become Ready
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - wait
+          - --for=condition=Ready
+          - helmreleases.helm.toolkit.fluxcd.io
+          - --all
+          - --all-namespaces
+          - --timeout=300s
+      changed_when: false
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Read Longhorn volume health
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - volumes.longhorn.io
+          - --namespace=longhorn-system
+          - --output=json
+      register: k3s_longhorn_volumes
+      changed_when: false
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Require all Longhorn volumes to be healthy
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((k3s_longhorn_volumes.stdout | from_json).items
+             | rejectattr('status.robustness', 'equalto', 'healthy')
+             | list | length) == 0
+        fail_msg: "One or more Longhorn volumes are not healthy after update."
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Display final K3s node status
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - nodes
+          - --output=wide
       register: k3s_nodes
       changed_when: false
+      when: inventory_hostname == groups['master'][0]
+
+    - name: Print final K3s node status
+      ansible.builtin.debug:
+        var: k3s_nodes.stdout_lines
       when: inventory_hostname == groups['master'][0]

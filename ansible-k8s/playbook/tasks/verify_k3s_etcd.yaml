@@ -1,0 +1,60 @@
+---
+- name: Check for etcdctl prerequisite
+  ansible.builtin.stat:
+    path: /usr/local/bin/etcdctl
+  register: k3s_etcdctl
+
+- name: Require etcdctl for authoritative quorum checks
+  ansible.builtin.assert:
+    that:
+      - k3s_etcdctl.stat.exists
+      - k3s_etcdctl.stat.executable
+    fail_msg: >-
+      /usr/local/bin/etcdctl is required on {{ inventory_hostname }} for
+      authoritative member and endpoint health checks.
+
+- name: Verify authoritative etcd membership and endpoint health
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import json
+        import subprocess
+        import sys
+        from urllib.parse import urlparse
+
+        etcdctl = [
+            "/usr/local/bin/etcdctl",
+            "--cacert=/var/lib/rancher/k3s/server/tls/etcd/server-ca.crt",
+            "--cert=/var/lib/rancher/k3s/server/tls/etcd/client.crt",
+            "--key=/var/lib/rancher/k3s/server/tls/etcd/client.key",
+        ]
+        members_run = subprocess.run(
+            etcdctl + ["member", "list", "--write-out=json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        members = json.loads(members_run.stdout)["members"]
+        expected_hosts = sorted(sys.argv[1:])
+        actual_hosts = sorted(
+            urlparse(url).hostname
+            for member in members
+            for url in member["peerURLs"]
+        )
+        if actual_hosts != expected_hosts:
+            raise SystemExit(
+                f"etcd members {actual_hosts} != inventory {expected_hosts}"
+            )
+        endpoints = ",".join(
+            url for member in members for url in member["clientURLs"]
+        )
+        subprocess.run(
+            etcdctl + ["endpoint", "health", f"--endpoints={endpoints}"],
+            check=True,
+        )
+      - "{{ hostvars[groups['master'][0]].ansible_host }}"
+      - "{{ hostvars[groups['master'][1]].ansible_host }}"
+      - "{{ hostvars[groups['master'][2]].ansible_host }}"
+  changed_when: false
