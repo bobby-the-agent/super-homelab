@@ -1,0 +1,20 @@
+---
+- name: Run an administration script
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Require a script filename from the repository scripts directory
+      ansible.builtin.assert:
+        that:
+          - script is defined
+          - (script | default('')) is match('^[A-Za-z0-9_][A-Za-z0-9_.-]*\.sh$')
+        fail_msg: "Pass a filename such as -e script=install_etcdctl.sh (no paths or arguments)."
+
+    - name: Run the selected script on each machine
+      ansible.builtin.script:
+        cmd: "{{ playbook_dir }}/../scripts/{{ script }}"
+        executable: /bin/bash
+      # Arbitrary scripts cannot reliably report whether they changed anything.
+      changed_when: true
