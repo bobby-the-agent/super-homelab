@@ -46,15 +46,21 @@ No executable bit is required: the runner explicitly invokes Bash.
 
 ## Included etcdctl installer
 
-- Pins upstream etcdctl v3.6.7 for Linux ARM64; other architectures fail safely.
+- Pins upstream etcdctl v3.7.3 for Linux ARM64; other architectures fail safely.
 - Verifies the archive against a pinned SHA-256 before extraction.
 - Installs only `/usr/local/bin/etcdctl`, not an etcd server or service.
 - Skips an already-installed matching client version. Replaces a different version.
 - Requires curl, sha256sum, tar, install, and mktemp on the target.
 - Does not restart K3s or change cluster membership.
 
-Source: https://github.com/etcd-io/etcd/releases/tag/v3.6.7
-Checksum: https://github.com/etcd-io/etcd/releases/download/v3.6.7/SHA256SUMS
+Installation method: [official v3.7 prebuilt binary instructions](https://etcd.io/docs/v3.7/install/).
+No Go compiler or source build is required. This updates the client only, not
+K3s's embedded etcd server. Client/server compatibility must be verified against
+the actual cluster before relying on upgrade health gates; this installer does
+not perform that check.
+
+Source: https://github.com/etcd-io/etcd/releases/tag/v3.7.3
+Checksum: https://github.com/etcd-io/etcd/releases/download/v3.7.3/SHA256SUMS
 
 ## Limitations and safety
 

@@ -2,9 +2,10 @@
 set -euo pipefail
 
 # Install only the client. Never install/start an etcd server or restart K3s.
-version='v3.6.7'
+# Official prebuilt binary workflow: https://etcd.io/docs/v3.7/install/
+version='v3.7.3'
 archive="etcd-${version}-linux-arm64.tar.gz"
-sha256='ef5fc443cf7cc5b82738f3c28363704896551900af90a6d622cae740b5644270'
+sha256='ce4c08f5f43d99f0d1993552ce2906829c0366077a97e5e52529337f151a29fb'
 target='/usr/local/bin/etcdctl'
 
 case "$(uname -m)" in
