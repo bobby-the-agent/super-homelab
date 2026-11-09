@@ -354,7 +354,7 @@
           - "--namespace={{ item.metadata.namespace }}"
           - --timeout=300s
       loop: >-
-        {{ (k3s_all_pods.stdout | from_json).items
+        {{ (k3s_all_pods.stdout | from_json)['items']
            | rejectattr('status.phase', 'equalto', 'Succeeded')
            | list }}
       loop_control:
@@ -442,7 +442,7 @@
       ansible.builtin.assert:
         that:
           - >-
-            ((k3s_longhorn_volumes.stdout | from_json).items
+            ((k3s_longhorn_volumes.stdout | from_json)['items']
              | rejectattr('status.robustness', 'equalto', 'healthy')
              | list | length) == 0
         fail_msg: "One or more Longhorn volumes are not healthy after update."
